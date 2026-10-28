@@ -433,7 +433,11 @@ defmodule ReqLLM.Providers.Azure.StreamingTest do
         }
       }
 
-      [chunk] = Azure.decode_stream_event(event, model)
+      [chunk] =
+        event
+        |> Azure.decode_stream_event(model)
+        |> Enum.reject(&(&1.type == :meta))
+
       assert chunk.type == :tool_call
       assert chunk.name == "get_weather"
     end

@@ -130,7 +130,7 @@ defmodule ReqLLM.Provider.AnthropicMaterializationTest do
     assert response.id == "msg_ordered"
     assert response.model == "claude-wire"
     assert response.finish_reason == :unknown
-    assert response.message.metadata == %{}
+    assert response.message.metadata == %{anthropic_content: body["content"]}
 
     assert response.message.content == [
              %ContentPart{type: :text, text: "First", metadata: %{}},
@@ -316,6 +316,146 @@ defmodule ReqLLM.Provider.AnthropicMaterializationTest do
 
     assert [%StreamChunk{type: :meta, metadata: %{response_id: "msg_stream_2"}} | _rest] =
              decode_events(events, model)
+  end
+
+  describe "verbatim assistant replay" do
+    @interleaved [
+      %{"type" => "thinking", "thinking" => "Plan", "signature" => "sig_1"},
+      %{"type" => "tool_use", "id" => "toolu_a", "name" => "lookup", "input" => %{"q" => "a"}},
+      %{"type" => "thinking", "thinking" => "Next", "signature" => "sig_2"},
+      %{"type" => "tool_use", "id" => "toolu_b", "name" => "lookup", "input" => %{"q" => "b"}}
+    ]
+
+    test "a buffered turn with thinking between tool calls replays in its original order", %{
+      model: model
+    } do
+      {:ok, response} =
+        Response.decode_response(
+          %{"id" => "msg_interleaved", "content" => @interleaved, "stop_reason" => "tool_use"},
+          model
+        )
+
+      assert [_user, %{role: "assistant", content: @interleaved}] =
+               replayed_messages(response, model)
+    end
+
+    test "a streamed turn is rebuilt from its deltas and replays in its original order", %{
+      model: model
+    } do
+      cited = %{
+        "type" => "text",
+        "text" => "Per the doc.",
+        "citations" => [%{"type" => "char_location", "cited_text" => "doc"}]
+      }
+
+      events =
+        interleaved_events() ++
+          [
+            start_event(4, %{"type" => "text", "text" => ""}),
+            delta_event(4, %{"type" => "text_delta", "text" => "Per the doc."}),
+            delta_event(4, %{"type" => "citations_delta", "citation" => hd(cited["citations"])}),
+            stop_event(4)
+          ]
+
+      response = build_streamed(events, model)
+
+      assert response.message.metadata.anthropic_content == @interleaved ++ [cited]
+
+      assert [_user, %{role: "assistant", content: content}] =
+               replayed_messages(response, model)
+
+      assert content == @interleaved ++ [cited]
+    end
+
+    test "an unknown delta type falls back to the normalized message", %{model: model} do
+      events =
+        interleaved_events() ++
+          [
+            start_event(4, %{"type" => "text", "text" => ""}),
+            delta_event(4, %{"type" => "future_delta", "value" => "?"}),
+            stop_event(4)
+          ]
+
+      refute Map.has_key?(build_streamed(events, model).message.metadata, :anthropic_content)
+    end
+
+    test "a block that started but never stopped falls back to the normalized message", %{
+      model: model
+    } do
+      events = interleaved_events() ++ [start_event(4, %{"type" => "text", "text" => "cut"})]
+      chunks = decode_events_without_flush(events, model)
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, %{finish_reason: :stop},
+          context: Context.new([Context.user("go")]),
+          model: model
+        )
+
+      refute Map.has_key?(response.message.metadata, :anthropic_content)
+    end
+  end
+
+  defp interleaved_events do
+    @interleaved
+    |> Enum.with_index()
+    |> Enum.flat_map(fn
+      {%{"type" => "thinking"} = block, index} ->
+        [
+          start_event(index, %{"type" => "thinking", "thinking" => "", "signature" => ""}),
+          delta_event(index, %{"type" => "thinking_delta", "thinking" => block["thinking"]}),
+          delta_event(index, %{"type" => "signature_delta", "signature" => block["signature"]}),
+          stop_event(index)
+        ]
+
+      {%{"type" => "tool_use"} = block, index} ->
+        [
+          start_event(index, Map.put(block, "input", %{})),
+          delta_event(index, %{
+            "type" => "input_json_delta",
+            "partial_json" => Jason.encode!(block["input"])
+          }),
+          stop_event(index)
+        ]
+    end)
+  end
+
+  defp start_event(index, block),
+    do: %{data: %{"type" => "content_block_start", "index" => index, "content_block" => block}}
+
+  defp delta_event(index, delta),
+    do: %{data: %{"type" => "content_block_delta", "index" => index, "delta" => delta}}
+
+  defp stop_event(index), do: %{data: %{"type" => "content_block_stop", "index" => index}}
+
+  defp build_streamed(events, model) do
+    {:ok, response} =
+      ResponseBuilder.build_response(
+        decode_events(events, model),
+        %{finish_reason: :tool_calls},
+        context: Context.new([Context.user("go")]),
+        model: model
+      )
+
+    response
+  end
+
+  defp replayed_messages(response, model) do
+    context =
+      if response.context.messages == [response.message],
+        do: Context.new([Context.user("go"), response.message]),
+        else: response.context
+
+    Anthropic.Context.encode_request(context, model)[:messages]
+  end
+
+  defp decode_events_without_flush(events, model) do
+    {chunks, _state} =
+      Enum.reduce(events, {[], Anthropic.init_stream_state(model)}, fn event, {chunks, state} ->
+        {event_chunks, next_state} = Anthropic.decode_stream_event(event, model, state)
+        {chunks ++ event_chunks, next_state}
+      end)
+
+    chunks
   end
 
   defp decode_events(events, model) do

@@ -70,6 +70,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       response_model: model_name,
       usage: usage,
       finish_reason: finish_reason,
+      message_metadata: raw_content_metadata(Map.get(data, "content")),
       provider_meta:
         data
         |> Map.drop(["id", "model", "content", "usage"])
@@ -134,7 +135,9 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       next_reasoning_index: 0,
       server_tool_blocks: %{},
       raw_thinking_blocks: %{},
-      after_server_tool?: false
+      after_server_tool?: false,
+      raw_blocks: %{},
+      raw_json: %{}
     }
   end
 
@@ -142,8 +145,26 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   @spec decode_stream_event(map(), LLMDB.Model.t(), map() | nil) ::
           {[ReqLLM.StreamChunk.t()], map()}
   def decode_stream_event(%{data: data}, _model, state) when is_map(data) do
-    state = ensure_stream_state(state)
+    {chunks, state} = decode_stateful_event(data, ensure_stream_state(state))
+    {raw_chunks, state} = track_raw_content(data, state)
+    {chunks ++ raw_chunks, state}
+  end
 
+  def decode_stream_event(_event, _model, state) do
+    {[], ensure_stream_state(state)}
+  end
+
+  @doc false
+  @spec flush_stream_state(LLMDB.Model.t(), map() | nil) :: {[ReqLLM.StreamChunk.t()], map()}
+  def flush_stream_state(_model, state) do
+    state = ensure_stream_state(state)
+    {details, state} = drain_thinking_blocks(state)
+    {server_tool_chunks, state} = drain_server_tool_blocks(state)
+    {raw_chunks, state} = drain_raw_blocks(state)
+    {reasoning_detail_chunks(details) ++ server_tool_chunks ++ raw_chunks, state}
+  end
+
+  defp decode_stateful_event(data, state) do
     case data do
       %{"type" => "message_start", "message" => message} ->
         {message_start_chunks(message), state}
@@ -180,18 +201,116 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     end
   end
 
-  def decode_stream_event(_event, _model, state) do
-    {[], ensure_stream_state(state)}
+  # The assistant turn exactly as the API returned it. Anthropic expects it
+  # back unchanged: reordering or dropping blocks (a thinking block hoisted
+  # past a `tool_use`, a text block losing its `citations`) counts as editing
+  # history, which invalidates thinking on models that check it. The encoder
+  # replays this list verbatim when it is present.
+  defp raw_content_metadata([_ | _] = content), do: %{anthropic_content: content}
+  defp raw_content_metadata(_content), do: %{}
+
+  # Streaming rebuilds each block from its start event and deltas, and emits
+  # it on `content_block_stop`. Each start is announced too, so the response
+  # builder can tell a block that never finished from one that never existed.
+  # A delta this decoder can't apply (an unknown type, or no start event)
+  # marks the block `:incomplete`; the builder then keeps the normalized
+  # message rather than replaying a block with missing content.
+  defp track_raw_content(
+         %{"type" => "content_block_start", "index" => index, "content_block" => block},
+         state
+       ),
+       do: {[raw_block_started_chunk(index)], put_raw_block(state, index, block)}
+
+  defp track_raw_content(
+         %{"type" => "content_block_delta", "index" => index, "delta" => delta},
+         state
+       ) do
+    case Map.fetch(state.raw_blocks, index) do
+      {:ok, block} ->
+        {[], apply_raw_delta(state, index, block, delta)}
+
+      :error ->
+        {[], put_raw_block(state, index, :incomplete)}
+    end
   end
 
-  @doc false
-  @spec flush_stream_state(LLMDB.Model.t(), map() | nil) :: {[ReqLLM.StreamChunk.t()], map()}
-  def flush_stream_state(_model, state) do
-    state = ensure_stream_state(state)
-    {details, state} = drain_thinking_blocks(state)
-    {server_tool_chunks, state} = drain_server_tool_blocks(state)
-    {reasoning_detail_chunks(details) ++ server_tool_chunks, state}
+  defp track_raw_content(%{"type" => "content_block_stop", "index" => index}, state) do
+    case Map.pop(state.raw_blocks, index) do
+      {nil, _raw_blocks} ->
+        {[], state}
+
+      {block, raw_blocks} ->
+        {json, raw_json} = Map.pop(state.raw_json, index)
+
+        {[raw_block_chunk(index, finalize_raw_input(block, json))],
+         %{state | raw_blocks: raw_blocks, raw_json: raw_json}}
+    end
   end
+
+  defp track_raw_content(_data, state), do: {[], state}
+
+  defp apply_raw_delta(state, index, _block, %{"type" => "input_json_delta"} = delta) do
+    fragment = Map.get(delta, "partial_json", "")
+    %{state | raw_json: Map.update(state.raw_json, index, [fragment], &[&1, fragment])}
+  end
+
+  defp apply_raw_delta(state, index, block, delta),
+    do: put_raw_block(state, index, merge_raw_delta(block, delta))
+
+  defp merge_raw_delta(:incomplete, _delta), do: :incomplete
+
+  defp merge_raw_delta(block, %{"type" => "text_delta", "text" => text}),
+    do: Map.update(block, "text", text, &(&1 <> text))
+
+  defp merge_raw_delta(block, %{"type" => "thinking_delta", "thinking" => text}),
+    do: Map.update(block, "thinking", text, &(&1 <> text))
+
+  defp merge_raw_delta(block, %{"type" => "signature_delta", "signature" => signature}),
+    do: Map.put(block, "signature", signature)
+
+  defp merge_raw_delta(block, %{"type" => "citations_delta", "citation" => citation}),
+    do: Map.update(block, "citations", [citation], &((&1 || []) ++ [citation]))
+
+  defp merge_raw_delta(_block, _delta), do: :incomplete
+
+  defp finalize_raw_input(block, nil), do: block
+  defp finalize_raw_input(:incomplete, _json), do: :incomplete
+
+  defp finalize_raw_input(block, json) do
+    case IO.iodata_to_binary(json) do
+      "" ->
+        Map.put_new(block, "input", %{})
+
+      binary ->
+        case Jason.decode(binary) do
+          {:ok, input} -> Map.put(block, "input", input)
+          {:error, _reason} -> :incomplete
+        end
+    end
+  end
+
+  defp drain_raw_blocks(%{raw_blocks: raw_blocks} = state) when map_size(raw_blocks) == 0,
+    do: {[], state}
+
+  defp drain_raw_blocks(state) do
+    chunks =
+      state.raw_blocks
+      |> Enum.sort_by(fn {index, _block} -> index end)
+      |> Enum.map(fn {index, block} ->
+        raw_block_chunk(index, finalize_raw_input(block, Map.get(state.raw_json, index)))
+      end)
+
+    {chunks, %{state | raw_blocks: %{}, raw_json: %{}}}
+  end
+
+  defp put_raw_block(state, index, block),
+    do: %{state | raw_blocks: Map.put(state.raw_blocks, index, block)}
+
+  defp raw_block_started_chunk(index),
+    do: ReqLLM.StreamChunk.meta(%{anthropic_content_block_started: index})
+
+  defp raw_block_chunk(index, block),
+    do: ReqLLM.StreamChunk.meta(%{anthropic_content_block: %{index: index, block: block}})
 
   # Private helper functions
 
@@ -508,6 +627,8 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     |> Map.put_new(:server_tool_blocks, %{})
     |> Map.put_new(:raw_thinking_blocks, %{})
     |> Map.put_new(:after_server_tool?, false)
+    |> Map.put_new(:raw_blocks, %{})
+    |> Map.put_new(:raw_json, %{})
   end
 
   # `message_start` carries the message id and the served model. Surfacing them

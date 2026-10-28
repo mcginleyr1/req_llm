@@ -2297,7 +2297,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
         encoded = ReqLLM.Providers.Anthropic.Context.encode_request(response.context, model)
         [assistant] = encoded[:messages]
 
-        assert [^use_block, ^result_block, %{type: "text", text: "Done."}] =
+        assert [^use_block, ^result_block, %{"type" => "text", "text" => "Done."}] =
                  assistant[:content]
 
         events = [
@@ -2312,7 +2312,9 @@ defmodule ReqLLM.Providers.AnthropicTest do
             {acc ++ next, state}
           end)
 
-        assert Enum.map(chunks, & &1.content_part.data) == [use_block, result_block]
+        assert chunks
+               |> Enum.filter(&(&1.type == :content_part))
+               |> Enum.map(& &1.content_part.data) == [use_block, result_block]
       end
     end
 
@@ -2362,7 +2364,11 @@ defmodule ReqLLM.Providers.AnthropicTest do
       encoded = ReqLLM.Providers.Anthropic.Context.encode_request(response.context, model)
       [assistant] = encoded[:messages]
 
-      assert assistant[:content] == [redacted, later_thinking, %{type: "text", text: "Done."}]
+      assert assistant[:content] == [
+               redacted,
+               later_thinking,
+               %{"type" => "text", "text" => "Done."}
+             ]
 
       events = [
         %{"type" => "content_block_start", "index" => 0, "content_block" => redacted},
@@ -2429,7 +2435,7 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert [
                %ReqLLM.StreamChunk{type: :content_part, content_part: use_part},
                %ReqLLM.StreamChunk{type: :content_part, content_part: result_part}
-             ] = chunks
+             ] = Enum.filter(chunks, &(&1.type == :content_part))
 
       assert use_part.data == @search_use
       assert use_part.metadata == %{provider: :anthropic, block_type: "server_tool_use"}
@@ -2447,11 +2453,14 @@ defmodule ReqLLM.Providers.AnthropicTest do
         }
       }
 
-      {[], state} =
+      {start_chunks, state} =
         Anthropic.decode_stream_event(event, model, Anthropic.init_stream_state(model))
 
-      {[chunk], _state} = ReqLLM.Providers.Anthropic.Response.flush_stream_state(model, state)
+      assert Enum.all?(start_chunks, &(&1.type == :meta))
 
+      {flushed, _state} = ReqLLM.Providers.Anthropic.Response.flush_stream_state(model, state)
+
+      assert [chunk] = Enum.filter(flushed, &(&1.type == :content_part))
       assert chunk.content_part.data == @search_use
     end
 
@@ -2616,7 +2625,12 @@ defmodule ReqLLM.Providers.AnthropicTest do
       [_user, assistant] = encoded[:messages]
       [thinking, search_use, search_result, thinking_after, text, tool_use] = assistant[:content]
 
-      assert thinking[:type] == "thinking" and thinking[:signature] == "sig_1"
+      assert thinking == %{
+               "type" => "thinking",
+               "thinking" => "Need the catalog.",
+               "signature" => "sig_1"
+             }
+
       assert search_use == @search_use
       assert search_result == @search_result
 
@@ -2626,8 +2640,14 @@ defmodule ReqLLM.Providers.AnthropicTest do
                "signature" => "sig_2"
              }
 
-      assert text == %{type: "text", text: "Creating it now."}
-      assert tool_use[:type] == "tool_use" and tool_use[:name] == "create_term"
+      assert text == %{"type" => "text", "text" => "Creating it now."}
+
+      assert tool_use == %{
+               "type" => "tool_use",
+               "id" => "toolu_01",
+               "name" => "create_term",
+               "input" => %{"name" => "hero"}
+             }
     end
 
     test "a block another provider owns is not replayed" do

@@ -106,6 +106,15 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     end)
   end
 
+  # An assistant turn decoded from an Anthropic response carries its original
+  # content blocks; replaying them unchanged is the only encoding Anthropic
+  # accepts for turns whose thinking it validates.
+  defp encode_message(%ReqLLM.Message{
+         role: :assistant,
+         metadata: %{anthropic_content: [_ | _] = content}
+       }),
+       do: %{role: "assistant", content: content}
+
   defp encode_message(%ReqLLM.Message{
          role: :assistant,
          tool_calls: tool_calls,
