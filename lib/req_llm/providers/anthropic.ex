@@ -174,6 +174,15 @@ defmodule ReqLLM.Providers.Anthropic do
       `authorization_token`. Reference each by name from an `mcp_toolset` tool
       and add the MCP client beta to `anthropic_beta`.
       """
+    ],
+    fallbacks: [
+      type: {:or, [:string, {:list, :map}]},
+      doc: """
+      Server-side refusal fallback: `"default"` (with the
+      `server-side-fallback-2026-07-01` beta) lets the API re-run a declined
+      request on a fallback model it chooses; a list of `%{model: "..."}`
+      (with `server-side-fallback-2026-06-01`) names the models to try.
+      """
     ]
   ]
 
@@ -182,7 +191,7 @@ defmodule ReqLLM.Providers.Anthropic do
   )a
 
   @body_options ~w(
-    temperature top_p stop_sequences thinking output_config container mcp_servers
+    temperature top_p stop_sequences thinking output_config container mcp_servers fallbacks
   )a
 
   @sampling_parameters [:temperature, :top_p, :top_k, :anthropic_top_k]

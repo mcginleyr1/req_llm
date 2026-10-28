@@ -2709,6 +2709,22 @@ defmodule ReqLLM.Providers.AnthropicTest do
       assert hd(request.headers["anthropic-beta"]) =~ "mcp-client-2025-11-20"
     end
 
+    test "the refusal fallback reaches the request body" do
+      {:ok, request} =
+        Anthropic.prepare_request(:chat, "anthropic:claude-opus-4-8", "Hello",
+          api_key: "test-key",
+          provider_options: [
+            fallbacks: "default",
+            anthropic_beta: ["server-side-fallback-2026-07-01"]
+          ]
+        )
+
+      decoded = request |> Anthropic.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      assert decoded["fallbacks"] == "default"
+      assert hd(request.headers["anthropic-beta"]) =~ "server-side-fallback-2026-07-01"
+    end
+
     test "user turns with wire-format content are sent as written" do
       {:ok, model} = ReqLLM.model("anthropic:claude-opus-4-8")
 
