@@ -158,6 +158,22 @@ defmodule ReqLLM.Providers.Anthropic do
 
       Example: %{variant: :bm25}
       """
+    ],
+    container: [
+      type: {:or, [:string, :map]},
+      doc: """
+      Code execution container to reuse: the `container` id a previous response
+      returned, or a map such as `%{id: "...", skills: [...]}`.
+      """
+    ],
+    mcp_servers: [
+      type: {:list, :map},
+      doc: """
+      Remote MCP servers Anthropic connects to on the request's behalf, each
+      `%{type: "url", url: "...", name: "..."}` with an optional
+      `authorization_token`. Reference each by name from an `mcp_toolset` tool
+      and add the MCP client beta to `anthropic_beta`.
+      """
     ]
   ]
 
@@ -166,7 +182,7 @@ defmodule ReqLLM.Providers.Anthropic do
   )a
 
   @body_options ~w(
-    temperature top_p stop_sequences thinking output_config
+    temperature top_p stop_sequences thinking output_config container mcp_servers
   )a
 
   @sampling_parameters [:temperature, :top_p, :top_k, :anthropic_top_k]
@@ -1315,6 +1331,10 @@ defmodule ReqLLM.Providers.Anthropic do
   @doc """
   Convert a ReqLLM.Tool to Anthropic's tool format.
 
+  Anthropic-defined tool maps carrying a `type` (e.g.
+  `%{type: "code_execution_20260521", name: "code_execution"}`, an
+  `mcp_toolset`, or a newer web search version) pass through unchanged.
+
   This is made public so that Bedrock and Vertex formatters can reuse it.
   """
   def tool_to_anthropic_format(%ReqLLM.Tool{} = tool) do
@@ -1336,6 +1356,9 @@ defmodule ReqLLM.Providers.Anthropic do
 
   def tool_to_anthropic_format(%{"name" => _, "description" => _, "input_schema" => _} = tool),
     do: tool
+
+  def tool_to_anthropic_format(%{type: type} = tool) when is_binary(type), do: tool
+  def tool_to_anthropic_format(%{"type" => type} = tool) when is_binary(type), do: tool
 
   defp existing_atom(value) when is_binary(value) do
     String.to_existing_atom(value)

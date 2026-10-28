@@ -2673,6 +2673,65 @@ defmodule ReqLLM.Providers.AnthropicTest do
     end
   end
 
+  describe "Anthropic-defined tools, containers and MCP servers" do
+    test "server tool maps, the container and MCP servers reach the request body" do
+      mcp_server = %{type: "url", url: "https://mcp.example.com/sse", name: "docs"}
+
+      {:ok, request} =
+        Anthropic.prepare_request(:chat, "anthropic:claude-opus-4-8", "Run it",
+          api_key: "test-key",
+          tools: [
+            %{type: "code_execution_20260521", name: "code_execution"},
+            %{type: "web_search_20260209", name: "web_search", max_uses: 2},
+            %{type: "mcp_toolset", mcp_server_name: "docs"}
+          ],
+          provider_options: [
+            container: "container_123",
+            mcp_servers: [mcp_server],
+            anthropic_beta: ["mcp-client-2025-11-20"]
+          ]
+        )
+
+      decoded = request |> Anthropic.encode_body() |> ReqLLM.Test.Helpers.json_body()
+
+      assert decoded["tools"] == [
+               %{"type" => "code_execution_20260521", "name" => "code_execution"},
+               %{"type" => "web_search_20260209", "name" => "web_search", "max_uses" => 2},
+               %{"type" => "mcp_toolset", "mcp_server_name" => "docs"}
+             ]
+
+      assert decoded["container"] == "container_123"
+
+      assert decoded["mcp_servers"] == [
+               %{"type" => "url", "url" => "https://mcp.example.com/sse", "name" => "docs"}
+             ]
+
+      assert hd(request.headers["anthropic-beta"]) =~ "mcp-client-2025-11-20"
+    end
+
+    test "user turns with wire-format content are sent as written" do
+      {:ok, model} = ReqLLM.model("anthropic:claude-opus-4-8")
+
+      tool_results = [
+        %{"type" => "tool_result", "tool_use_id" => "toolu_a", "content" => "a"},
+        %{"type" => "tool_result", "tool_use_id" => "toolu_b", "content" => "b"}
+      ]
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [],
+            metadata: %{anthropic_content: tool_results}
+          }
+        ]
+      }
+
+      assert [%{role: "user", content: ^tool_results}] =
+               ReqLLM.Providers.Anthropic.Context.encode_request(context, model)[:messages]
+    end
+  end
+
   describe "web fetch tool" do
     test "encode_body with web_fetch configuration" do
       {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-6")

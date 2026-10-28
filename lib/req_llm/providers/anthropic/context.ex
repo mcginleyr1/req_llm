@@ -108,12 +108,15 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   # An assistant turn decoded from an Anthropic response carries its original
   # content blocks; replaying them unchanged is the only encoding Anthropic
-  # accepts for turns whose thinking it validates.
+  # accepts for turns whose thinking it validates. Callers that keep their
+  # history in Anthropic's wire format can set the same metadata on user turns
+  # (e.g. `tool_result` blocks, documents, images) to send them as written.
   defp encode_message(%ReqLLM.Message{
-         role: :assistant,
+         role: role,
          metadata: %{anthropic_content: [_ | _] = content}
-       }),
-       do: %{role: "assistant", content: content}
+       })
+       when role in [:user, :assistant],
+       do: %{role: Atom.to_string(role), content: content}
 
   defp encode_message(%ReqLLM.Message{
          role: :assistant,
@@ -533,6 +536,9 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   defp encode_tools(tools) do
     Enum.map(tools, &encode_tool/1)
   end
+
+  defp encode_tool(tool) when is_map(tool) and not is_struct(tool),
+    do: ReqLLM.Providers.Anthropic.tool_to_anthropic_format(tool)
 
   defp encode_tool(tool) do
     # Convert from ReqLLM tool to Anthropic format
