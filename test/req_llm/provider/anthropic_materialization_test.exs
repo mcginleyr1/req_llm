@@ -318,6 +318,35 @@ defmodule ReqLLM.Provider.AnthropicMaterializationTest do
              decode_events(events, model)
   end
 
+  test "a streamed response surfaces its code execution container", %{model: model} do
+    container = %{"id" => "container_1", "expires_at" => "2026-11-27T00:00:00Z"}
+
+    chunks =
+      decode_events(
+        [
+          %{
+            data: %{
+              "type" => "message_start",
+              "message" => %{"id" => "msg_c", "container" => container}
+            }
+          },
+          %{
+            data: %{
+              "type" => "message_delta",
+              "delta" => %{"stop_reason" => "end_turn", "container" => container}
+            }
+          }
+        ],
+        model
+      )
+
+    containers =
+      for %StreamChunk{type: :meta, metadata: %{provider_meta: %{"container" => found}}} <- chunks,
+          do: found
+
+    assert containers == [container, container]
+  end
+
   describe "verbatim assistant replay" do
     @interleaved [
       %{"type" => "thinking", "thinking" => "Plan", "signature" => "sig_1"},

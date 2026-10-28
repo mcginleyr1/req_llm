@@ -640,6 +640,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       |> maybe_put_meta(:response_id, Map.get(message, "id"))
       |> maybe_put_meta(:response_model, Map.get(message, "model"))
       |> put_pricing_metadata(Map.get(message, "usage"))
+      |> put_container_meta(Map.get(message, "container"))
 
     case Map.get(message, "usage", %{}) do
       usage_data when usage_data == %{} -> []
@@ -665,6 +666,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     chunks = [
       %{finish_reason: finish_reason, terminal?: true}
       |> put_stop_reason_meta(stop_reason)
+      |> put_container_meta(Map.get(delta, "container"))
       |> ReqLLM.StreamChunk.meta()
     ]
 
@@ -697,6 +699,19 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     do: Map.put(meta, :provider_meta, %{"stop_reason" => stop_reason})
 
   defp put_stop_reason_meta(meta, _stop_reason), do: meta
+
+  # The code execution container a streamed response ran in, so callers can
+  # reuse it (`container` request option) as buffered callers do from the body.
+  defp put_container_meta(meta, %{} = container) do
+    Map.update(
+      meta,
+      :provider_meta,
+      %{"container" => container},
+      &Map.put(&1, "container", container)
+    )
+  end
+
+  defp put_container_meta(meta, _container), do: meta
 
   defp start_thinking_block(state, index, block) do
     text = extract_thinking_text(block)
